@@ -75,10 +75,11 @@ def check_mentions():
                 sender = msg.get("user", "unknown")
 
                 message_text = (
-                    f"🔔 *Unacknowledged Mention*\n"
+
+                    f"You were mentioned:\n"
                     f"Channel: #{channel_name}\n"
                     f"From: <@{sender}>\n"
-                    f"Message: {msg_text[:150]}\n"
+                    
                     f"<{msg_link}|👉 View Message>"
                 )
 
