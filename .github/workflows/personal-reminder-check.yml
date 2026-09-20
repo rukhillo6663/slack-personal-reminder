@@ -1,0 +1,29 @@
+name: Personal Reminder Bot - Hourly Check
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+jobs:
+  check-mentions:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: pip install slack-sdk
+      
+      - name: Run personal reminder bot
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          YOUR_USER_ID: ${{ secrets.YOUR_USER_ID }}
+          CHANNELS_TO_MONITOR: ${{ secrets.CHANNELS_TO_MONITOR }}
+        run: python personal-reminder-bot.py
