@@ -76,20 +76,18 @@ def check_mentions():
 
                         user_id = msg.get("user", "unknown")
 
-                        dm_result = client.conversations_open(users=YOUR_USER_ID)
-
                         message_text = (
-                            f"🔔 *Unacknowledged Mention*\n"
-                            f"Channel: #{channel_name}\n"
-                            f"From: <@{user_id}>\n"
-                            f"Message: {msg_text[:150]}\n"
-                            f"<{msg_link}|👉 View Message>"
-                        )
+    f"🔔 *Unacknowledged Mention*\n"
+    f"Channel: #{channel_name}\n"
+    f"From: <@{user_id}>\n"
+    f"Message: {msg_text[:150]}\n"
+    f"<{msg_link}|👉 View Message>"
+)
 
-                        client.chat_postMessage(
-                            channel=dm_result["channel"]["id"],
-                            text=message_text
-                        )
+client.chat_postMessage(
+    channel=YOUR_USER_ID,   # DM the user directly — no conversations.open needed
+    text=message_text
+)
 
                         sent_messages.add(msg_id)
                         mentions_found += 1
