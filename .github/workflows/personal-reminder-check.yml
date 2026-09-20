@@ -19,7 +19,7 @@ jobs:
           python-version: '3.11'
       
       - name: Install dependencies
-        run: pip install slack-sdk
+        run: pip install slack-sdk schedule
       
       - name: Run personal reminder bot
         env:
