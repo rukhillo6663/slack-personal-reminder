@@ -18,6 +18,11 @@ if not SLACK_BOT_TOKEN or not YOUR_USER_ID or not CHANNELS_TO_MONITOR:
     exit(1)
 
 client = WebClient(token=SLACK_BOT_TOKEN)
+try:
+    auth = client.auth_test()
+    print(f"🔑 Token OK — bot user: {auth.get('user')} | scopes: {auth.headers.get('x-oauth-scopes')}")
+except Exception as e:
+    print(f"❌ Token check failed: {e}")
 
 # File to track already-notified messages
 SENT_LOG_FILE = "sent_messages.json"
