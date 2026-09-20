@@ -21,7 +21,7 @@ client = WebClient(token=SLACK_BOT_TOKEN)
 def check_mentions():
     print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🔍 Scanning for unacknowledged mentions...")
     
-    one_hour_ago = int((datetime.now() - timedelta(hours=1)).timestamp())
+  one_hour_ago = int((datetime.now() - timedelta(hours=24)).timestamp())
     mentions_found = 0
     
     for channel_id in CHANNELS_TO_MONITOR:
