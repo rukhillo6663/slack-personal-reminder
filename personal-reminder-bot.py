@@ -3,34 +3,33 @@ import json
 from slack_sdk import WebClient
 from datetime import datetime, timedelta
 
-# Read from GitHub Secrets
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 YOUR_USER_ID = os.environ.get("YOUR_USER_ID")
 CHANNELS_STR = os.environ.get("CHANNELS_TO_MONITOR", "")
 CHANNELS_TO_MONITOR = [ch.strip() for ch in CHANNELS_STR.split(",") if ch.strip()]
 
-# Validate secrets
 if not SLACK_BOT_TOKEN or not YOUR_USER_ID or not CHANNELS_TO_MONITOR:
     print("❌ ERROR: Missing required secrets!")
-    print(f"   SLACK_BOT_TOKEN: {'set' if SLACK_BOT_TOKEN else 'MISSING'}")
-    print(f"   YOUR_USER_ID: {'set' if YOUR_USER_ID else 'MISSING'}")
-    print(f"   CHANNELS_TO_MONITOR: {'set' if CHANNELS_TO_MONITOR else 'MISSING'}")
     exit(1)
 
 client = WebClient(token=SLACK_BOT_TOKEN)
+
 try:
     auth = client.auth_test()
     print(f"🔑 Token OK — bot user: {auth.get('user')} | scopes: {auth.headers.get('x-oauth-scopes')}")
 except Exception as e:
     print(f"❌ Token check failed: {e}")
+    exit(1)
 
-# File to track already-notified messages
 SENT_LOG_FILE = "sent_messages.json"
 
 def load_sent_messages():
     if os.path.exists(SENT_LOG_FILE):
-        with open(SENT_LOG_FILE, "r") as f:
-            return set(json.load(f))
+        try:
+            with open(SENT_LOG_FILE, "r") as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
     return set()
 
 def save_sent_messages(sent):
@@ -46,57 +45,49 @@ def check_mentions():
 
     for channel_id in CHANNELS_TO_MONITOR:
         try:
-            result = client.conversations_history(
-                channel=channel_id,
-                oldest=since
-            )
+            result = client.conversations_history(channel=channel_id, oldest=since)
 
             for msg in result.get("messages", []):
                 msg_text = msg.get("text", "")
 
-                if f"<@{YOUR_USER_ID}>" in msg_text:
-                    msg_id = msg.get("ts")
+                if f"<@{YOUR_USER_ID}>" not in msg_text:
+                    continue
 
-                    # Skip if already notified
-                    if msg_id in sent_messages:
-                        print(f"⏭ Already notified for message {msg_id}, skipping.")
-                        continue
+                msg_id = msg.get("ts")
 
-                    # Check if message has reactions
-                    has_reactions = "reactions" in msg and len(msg.get("reactions", [])) > 0
+                if msg_id in sent_messages:
+                    continue
 
-                    if not has_reactions:
-                        msg_link = f"https://slack.com/archives/{channel_id}/p{msg_id.replace('.', '')}"
+                has_reactions = len(msg.get("reactions", [])) > 0
 
-                        try:
-                            channel_info = client.conversations_info(channel=channel_id)
-                            channel_name = channel_info["channel"]["name"]
-                        except:
-                            channel_name = channel_id
+                if has_reactions:
+                    sent_messages.add(msg_id)
+                    continue
 
-                        user_id = msg.get("user", "unknown")
+                msg_link = f"https://slack.com/archives/{channel_id}/p{msg_id.replace('.', '')}"
 
-                        message_text = (
-    f"🔔 *Unacknowledged Mention*\n"
-    f"Channel: #{channel_name}\n"
-    f"From: <@{user_id}>\n"
-    f"Message: {msg_text[:150]}\n"
-    f"<{msg_link}|👉 View Message>"
-)
+                try:
+                    channel_info = client.conversations_info(channel=channel_id)
+                    channel_name = channel_info["channel"]["name"]
+                except Exception:
+                    channel_name = channel_id
 
-client.chat_postMessage(
-    channel=YOUR_USER_ID,   # DM the user directly — no conversations.open needed
-    text=message_text
-)
+                sender = msg.get("user", "unknown")
 
-                        sent_messages.add(msg_id)
-                        mentions_found += 1
-                        print(f"✅ DM sent for mention in #{channel_name}")
+                message_text = (
+                    f"🔔 *Unacknowledged Mention*\n"
+                    f"Channel: #{channel_name}\n"
+                    f"From: <@{sender}>\n"
+                    f"Message: {msg_text[:150]}\n"
+                    f"<{msg_link}|👉 View Message>"
+                )
 
-                    else:
-                        # Mark as seen so we don't check it again
-                        sent_messages.add(msg_id)
-                        print(f"⏭ Mention in {channel_id} already has reactions, skipping.")
+                # DM the user directly — needs only chat:write, no conversations.open
+                client.chat_postMessage(channel=YOUR_USER_ID, text=message_text)
+
+                sent_messages.add(msg_id)
+                mentions_found += 1
+                print(f"✅ DM sent for mention in #{channel_name}")
 
         except Exception as e:
             print(f"❌ Error checking {channel_id}: {str(e)}")
