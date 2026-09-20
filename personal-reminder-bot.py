@@ -40,7 +40,7 @@ def check_mentions():
     print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🔍 Scanning last 24h for unacknowledged mentions...")
 
     sent_messages = load_sent_messages()
-    since = int((datetime.now() - timedelta(hours=24)).timestamp())
+    since = int((datetime.now() - timedelta(hours=2)).timestamp())
     mentions_found = 0
 
     for channel_id in CHANNELS_TO_MONITOR:
