@@ -5,14 +5,11 @@ on:
     - cron: '0 * * * *'
   workflow_dispatch:
 
-concurrency:
-  group: personal-reminder-bot
-  cancel-in-progress: false
-
 jobs:
   check-mentions:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
