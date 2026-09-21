@@ -1,104 +1,106 @@
 import os
-import json
 from slack_sdk import WebClient
 from datetime import datetime, timedelta
 
+# Bot token (xoxb-...) — used only for sending you DMs
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
-YOUR_USER_ID = os.environ.get("YOUR_USER_ID")
-CHANNELS_STR = os.environ.get("CHANNELS_TO_MONITOR", "")
-CHANNELS_TO_MONITOR = [ch.strip() for ch in CHANNELS_STR.split(",") if ch.strip()]
 
-if not SLACK_BOT_TOKEN or not YOUR_USER_ID or not CHANNELS_TO_MONITOR:
-    print("❌ ERROR: Missing required secrets!")
+# User token (xoxp-...) — used for searching your mentions
+SLACK_USER_TOKEN = os.environ.get("SLACK_USER_TOKEN")
+
+# Your Slack user ID
+YOUR_USER_ID = os.environ.get("YOUR_USER_ID")
+
+if not SLACK_BOT_TOKEN or not SLACK_USER_TOKEN or not YOUR_USER_ID:
+    print("❌ ERROR: Missing required secrets! Need SLACK_BOT_TOKEN, SLACK_USER_TOKEN, and YOUR_USER_ID.")
     exit(1)
 
-client = WebClient(token=SLACK_BOT_TOKEN)
+# Two clients: one for searching (as you), one for sending DMs (as the bot)
+user_client = WebClient(token=SLACK_USER_TOKEN)
+bot_client = WebClient(token=SLACK_BOT_TOKEN)
+
+# Verify both tokens on startup
+try:
+    user_auth = user_client.auth_test()
+    print(f"🔑 User token OK — searching as: {user_auth.get('user')}")
+except Exception as e:
+    print(f"❌ User token check failed: {e}")
+    exit(1)
 
 try:
-    auth = client.auth_test()
-    print(f"🔑 Token OK — bot user: {auth.get('user')} | scopes: {auth.headers.get('x-oauth-scopes')}")
+    bot_auth = bot_client.auth_test()
+    print(f"🤖 Bot token OK — DMs sent by: {bot_auth.get('user')}")
 except Exception as e:
-    print(f"❌ Token check failed: {e}")
+    print(f"❌ Bot token check failed: {e}")
     exit(1)
 
-SENT_LOG_FILE = "sent_messages.json"
-
-def load_sent_messages():
-    if os.path.exists(SENT_LOG_FILE):
-        try:
-            with open(SENT_LOG_FILE, "r") as f:
-                return set(json.load(f))
-        except Exception:
-            return set()
-    return set()
-
-def save_sent_messages(sent):
-    with open(SENT_LOG_FILE, "w") as f:
-        json.dump(list(sent), f)
 
 def check_mentions():
-    print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🔍 Scanning last 24h for unacknowledged mentions...")
+    print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🔍 Searching for unacknowledged mentions in last 24h...")
 
-    sent_messages = load_sent_messages()
-    since = int((datetime.now() - timedelta(hours=2)).timestamp())
+    # Search for messages mentioning you, posted in the last 24 hours
+    # This uses YOUR account visibility — no channel membership needed for the bot
+    since = datetime.now() - timedelta(hours=24)
+    date_str = since.strftime("%Y-%m-%d")
+    query = f"<@{YOUR_USER_ID}> after:{date_str}"
+
     mentions_found = 0
 
-    for channel_id in CHANNELS_TO_MONITOR:
-        try:
-            result = client.conversations_history(channel=channel_id, oldest=since)
+    try:
+        result = user_client.search_messages(query=query, sort="timestamp", sort_dir="desc", count=100)
+        matches = result.get("messages", {}).get("matches", [])
+        print(f"📋 Found {len(matches)} mention(s) in search results")
 
-            for msg in result.get("messages", []):
-                msg_text = msg.get("text", "")
+        for msg in matches:
+            msg_ts = msg.get("ts")
+            channel_id = msg.get("channel", {}).get("id")
+            channel_name = msg.get("channel", {}).get("name", channel_id)
+            msg_text = msg.get("text", "")
+            sender = msg.get("user", "unknown")
+            permalink = msg.get("permalink", "")
 
-                if f"<@{YOUR_USER_ID}>" not in msg_text:
-                    continue
+            if not channel_id or not msg_ts:
+                continue
 
-                msg_id = msg.get("ts")
+            # Check if the message already has a reaction (acknowledged)
+            # We use the user token here so we can see reactions in channels we're in
+            try:
+                reactions_result = user_client.reactions_get(channel=channel_id, timestamp=msg_ts)
+                message_data = reactions_result.get("message", {})
+                has_reactions = len(message_data.get("reactions", [])) > 0
+            except Exception as e:
+                print(f"⚠️ Could not check reactions for message in #{channel_name}: {e}")
+                has_reactions = False
 
-                if msg_id in sent_messages:
-                    continue
+            if has_reactions:
+                print(f"✓ Skipping #{channel_name} — already has reaction")
+                continue
 
-                has_reactions = len(msg.get("reactions", [])) > 0
-
-                if has_reactions:
-                    sent_messages.add(msg_id)
-                    continue
-
-                msg_link = f"https://slack.com/archives/{channel_id}/p{msg_id.replace('.', '')}"
-
-                try:
-                    channel_info = client.conversations_info(channel=channel_id)
-                    channel_name = channel_info["channel"]["name"]
-                except Exception:
-                    channel_name = channel_id
-
-                sender = msg.get("user", "unknown")
-
-                message_text = (
+            # No reaction — send DM via the bot
+           message_text = (
 
                     f"You were mentioned:\n"
                     f"Channel: #{channel_name}\n"
                     f"From: <@{sender}>\n"
-                    
-                    f"<{msg_link}|👉 View Message>"
+
+                    f"<{msg_link}|:point_right: View Message>"
                 )
 
-                # DM the user directly — needs only chat:write, no conversations.open
-                client.chat_postMessage(channel=YOUR_USER_ID, text=message_text)
-
-                sent_messages.add(msg_id)
+            try:
+                bot_client.chat_postMessage(channel=YOUR_USER_ID, text=message_text)
                 mentions_found += 1
                 print(f"✅ DM sent for mention in #{channel_name}")
+            except Exception as e:
+                print(f"❌ Failed to send DM for #{channel_name}: {e}")
 
-        except Exception as e:
-            print(f"❌ Error checking {channel_id}: {str(e)}")
-
-    save_sent_messages(sent_messages)
+    except Exception as e:
+        print(f"❌ Search failed: {e}")
 
     if mentions_found == 0:
-        print("✓ No unacknowledged mentions found.")
+        print("✓ No unacknowledged mentions to notify about.")
     else:
         print(f"✓ Done. {mentions_found} DM(s) sent.")
+
 
 if __name__ == "__main__":
     check_mentions()
