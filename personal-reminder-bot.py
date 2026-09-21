@@ -1,100 +1,208 @@
 import os
-from slack_sdk import WebClient
+import re
 from datetime import datetime, timedelta
 
-# Bot token (xoxb-...) — used only for sending you DMs
+from slack_sdk import WebClient
+from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
+
+# ---------------------------------------------------------------------------
+# Secrets (GitHub → Settings → Secrets → Actions)
+#   SLACK_BOT_TOKEN   xoxb-...  used ONLY to send you the reminder DM
+#   SLACK_USER_TOKEN  xoxp-...  used to search your mentions + check reactions
+#   YOUR_USER_ID      your Slack user ID
+# ---------------------------------------------------------------------------
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
-
-# User token (xoxp-...) — used for searching your mentions and checking reactions
 SLACK_USER_TOKEN = os.environ.get("SLACK_USER_TOKEN")
-
-# Your Slack user ID
 YOUR_USER_ID = os.environ.get("YOUR_USER_ID")
+
+LOOKBACK_HOURS = 24        # how far back to look for mentions
+MAX_ITEMS_IN_DM = 40       # safety cap on items listed in one reminder
+MAX_SEARCH_PAGES = 3       # safety cap on search pagination (100 results/page)
 
 if not SLACK_BOT_TOKEN or not SLACK_USER_TOKEN or not YOUR_USER_ID:
     print("ERROR: Missing required secrets! Need SLACK_BOT_TOKEN, SLACK_USER_TOKEN, and YOUR_USER_ID.")
-    exit(1)
+    raise SystemExit(1)
 
-# Two clients: one for searching (as you), one for sending DMs (as the bot)
 user_client = WebClient(token=SLACK_USER_TOKEN)
 bot_client = WebClient(token=SLACK_BOT_TOKEN)
+for _c in (user_client, bot_client):
+    _c.retry_handlers.append(RateLimitErrorRetryHandler(max_retry_count=3))
 
-# Verify both tokens on startup
+# ---- verify tokens --------------------------------------------------------
 try:
     user_auth = user_client.auth_test()
-    print(f"User token OK - searching as: {user_auth.get('user')}")
+    user_scopes = user_auth.headers.get("x-oauth-scopes", "") or ""
+    print(f"User token OK - searching as: {user_auth.get('user')} | scopes: {user_scopes}")
 except Exception as e:
     print(f"ERROR: User token check failed: {e}")
-    exit(1)
+    raise SystemExit(1)
+
+if user_scopes:
+    granted = {s.strip() for s in user_scopes.split(",")}
+    for required in ("search:read", "reactions:read"):
+        if required not in granted:
+            print(
+                f"ERROR: User token is missing the '{required}' scope. "
+                "Add it under User Token Scopes, click 'Reinstall to Workspace', "
+                "then update SLACK_USER_TOKEN with the NEW xoxp- token."
+            )
+            raise SystemExit(1)
 
 try:
     bot_auth = bot_client.auth_test()
-    print(f"Bot token OK - DMs sent by: {bot_auth.get('user')}")
+    BOT_USER_ID = bot_auth.get("user_id")
+    BOT_USERNAME = bot_auth.get("user")
+    print(f"Bot token OK - DMs sent by: {BOT_USERNAME} ({BOT_USER_ID})")
 except Exception as e:
     print(f"ERROR: Bot token check failed: {e}")
-    exit(1)
+    raise SystemExit(1)
+
+# ---- helpers ---------------------------------------------------------------
+_name_cache = {}
 
 
+def display_name(user_id):
+    """Plain-text name for a user ID (never a real <@mention>, so the reminder
+    itself can never be picked up as a mention on the next run)."""
+    if not user_id:
+        return "unknown"
+    if user_id in _name_cache:
+        return _name_cache[user_id]
+    name = user_id
+    try:
+        u = bot_client.users_info(user=user_id).get("user", {}) or {}
+        name = u.get("real_name") or (u.get("profile") or {}).get("display_name") or u.get("name") or user_id
+    except Exception:
+        pass
+    _name_cache[user_id] = name
+    return name
+
+
+MENTION_RE = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]*)?>")
+CHANNEL_RE = re.compile(r"<#([A-Z0-9]+)\|([^>]*)>")
+
+
+def clean_text(text, limit=150):
+    text = MENTION_RE.sub(
+        lambda m: "@you" if m.group(1) == YOUR_USER_ID else "@" + display_name(m.group(1)), text or ""
+    )
+    text = CHANNEL_RE.sub(lambda m: "#" + m.group(2), text)
+    text = " ".join(text.split())
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
+def is_bots_own_message(msg):
+    ch = msg.get("channel") or {}
+    return (
+        msg.get("user") == BOT_USER_ID
+        or msg.get("username") == BOT_USERNAME
+        or ch.get("name") == BOT_USER_ID  # the DM channel between you and the bot
+    )
+
+
+def has_reaction(channel_id, ts):
+    r = user_client.reactions_get(channel=channel_id, timestamp=ts)
+    return len((r.get("message") or {}).get("reactions", [])) > 0
+
+
+def search_recent_mentions():
+    now = datetime.now()
+    since_ts = (now - timedelta(hours=LOOKBACK_HOURS)).timestamp()
+    # Slack's after: filter is day-granular and exclusive, so ask for a wider
+    # window and trim precisely by timestamp below.
+    after_date = (now - timedelta(hours=LOOKBACK_HOURS + 24)).strftime("%Y-%m-%d")
+    query = f"<@{YOUR_USER_ID}> after:{after_date}"
+
+    matches, page = [], 1
+    while page <= MAX_SEARCH_PAGES:
+        res = user_client.search_messages(query=query, sort="timestamp", sort_dir="desc", count=100, page=page)
+        block = res.get("messages", {}) or {}
+        page_matches = block.get("matches", []) or []
+        matches.extend(page_matches)
+        total_pages = (block.get("paging") or {}).get("pages") or 1
+        if not page_matches or page >= total_pages:
+            break
+        # results are newest-first: stop once we're past the window
+        if float(page_matches[-1].get("ts", "0")) < since_ts:
+            break
+        page += 1
+    return matches, since_ts
+
+
+# ---- main ------------------------------------------------------------------
 def check_mentions():
-    print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Searching for unacknowledged mentions in last 24h...")
-
-    since = datetime.now() - timedelta(hours=24)
-    date_str = since.strftime("%Y-%m-%d")
-    query = f"<@{YOUR_USER_ID}> after:{date_str}"
-
-    mentions_found = 0
+    print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Searching for unacknowledged mentions in last {LOOKBACK_HOURS}h...")
 
     try:
-        result = user_client.search_messages(query=query, sort="timestamp", sort_dir="desc", count=100)
-        matches = result.get("messages", {}).get("matches", [])
-        print(f"Found {len(matches)} mention(s) in search results")
-
-        for msg in matches:
-            msg_ts = msg.get("ts")
-            channel_id = msg.get("channel", {}).get("id")
-            channel_name = msg.get("channel", {}).get("name", channel_id)
-            msg_text = msg.get("text", "")
-            sender = msg.get("user", "unknown")
-            permalink = msg.get("permalink", "")
-
-            if not channel_id or not msg_ts:
-                continue
-
-            # Check if the message already has a reaction (acknowledged)
-            try:
-                reactions_result = user_client.reactions_get(channel=channel_id, timestamp=msg_ts)
-                message_data = reactions_result.get("message", {})
-                has_reactions = len(message_data.get("reactions", [])) > 0
-            except Exception as e:
-                print(f"Could not check reactions for message in #{channel_name}: {e}")
-                has_reactions = False
-
-            if has_reactions:
-                print(f"Skipping #{channel_name} - already has reaction")
-                continue
-
-            # No reaction — send DM via the bot
-            message_text = (
-                f"You were mentioned\n"
-                f"Channel: #{channel_name}\n"
-                f"From: <@{sender}>\n"
-                f"<{permalink}|View Message>"
-            )
-
-            try:
-                bot_client.chat_postMessage(channel=YOUR_USER_ID, text=message_text)
-                mentions_found += 1
-                print(f"DM sent for mention in #{channel_name}")
-            except Exception as e:
-                print(f"Failed to send DM for #{channel_name}: {e}")
-
+        matches, since_ts = search_recent_mentions()
     except Exception as e:
         print(f"ERROR: Search failed: {e}")
+        raise SystemExit(1)
+    print(f"Search returned {len(matches)} result(s)")
 
-    if mentions_found == 0:
-        print("No unacknowledged mentions to notify about.")
-    else:
-        print(f"Done. {mentions_found} DM(s) sent.")
+    seen = set()
+    pending = []
+    skipped_reacted = skipped_bot = skipped_old = 0
+
+    for msg in matches:
+        ts = msg.get("ts")
+        ch = msg.get("channel") or {}
+        channel_id = ch.get("id")
+        if not ts or not channel_id:
+            continue
+        if (channel_id, ts) in seen:
+            continue
+        seen.add((channel_id, ts))
+
+        if float(ts) < since_ts:
+            skipped_old += 1
+            continue
+        if is_bots_own_message(msg):
+            skipped_bot += 1
+            continue
+
+        try:
+            if has_reaction(channel_id, ts):
+                skipped_reacted += 1
+                continue
+        except Exception as e:
+            if "missing_scope" in str(e):
+                print(f"ERROR: reactions.get is missing a scope: {e}")
+                raise SystemExit(1)
+            print(f"WARN: could not check reactions for {channel_id}/{ts}, skipping this run: {e}")
+            continue
+
+        if msg.get("type") == "im" or ch.get("is_im"):
+            where = "DM with " + display_name(ch.get("name"))
+        else:
+            where = "#" + (ch.get("name") or channel_id)
+
+        pending.append({
+            "where": where,
+            "from": display_name(msg.get("user")),
+            "text": clean_text(msg.get("text")),
+            "link": msg.get("permalink", ""),
+        })
+
+    print(f"Skipped: {skipped_reacted} already reacted, {skipped_bot} bot's own reminders, {skipped_old} outside window")
+
+    if not pending:
+        print("No unacknowledged mentions. Nothing sent.")
+        return
+
+    n = len(pending)
+    lines = [f"*You have {n} unacknowledged mention{'s' if n != 1 else ''}* (no emoji reaction yet). React to the original message to clear it."]
+    for it in pending[:MAX_ITEMS_IN_DM]:
+        lines.append(f"• *{it['where']}* — {it['from']}: \"{it['text']}\"  <{it['link']}|Open>")
+    if n > MAX_ITEMS_IN_DM:
+        lines.append(f"...and {n - MAX_ITEMS_IN_DM} more.")
+
+    try:
+        bot_client.chat_postMessage(channel=YOUR_USER_ID, text="\n".join(lines), unfurl_links=False, unfurl_media=False)
+        print(f"Done. 1 reminder DM sent listing {n} mention(s).")
+    except Exception as e:
+        print(f"ERROR: Failed to send reminder DM: {e}")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
