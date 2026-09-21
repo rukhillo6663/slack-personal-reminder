@@ -5,22 +5,23 @@ on:
     - cron: '0 * * * *'
   workflow_dispatch:
 
+concurrency:
+  group: personal-reminder-bot
+  cancel-in-progress: false
+
 jobs:
   check-mentions:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 5
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
-      
+        uses: actions/checkout@v6
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
-      
+          python-version: '3.12'
       - name: Install dependencies
-        run: pip install slack-sdk schedule
-      
+        run: pip install slack-sdk
       - name: Run personal reminder bot
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
