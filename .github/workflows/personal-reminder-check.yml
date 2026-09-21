@@ -24,6 +24,6 @@ jobs:
       - name: Run personal reminder bot
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_USER_TOKEN: ${{ secrets.SLACK_USER_TOKEN }}
           YOUR_USER_ID: ${{ secrets.YOUR_USER_ID }}
-          CHANNELS_TO_MONITOR: ${{ secrets.CHANNELS_TO_MONITOR }}
         run: python personal-reminder-bot.py
