@@ -8,7 +8,7 @@ from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
 # ---------------------------------------------------------------------------
 # Secrets (GitHub → Settings → Secrets → Actions)
 #   SLACK_BOT_TOKEN   xoxb-...  used ONLY to send you the reminder DM
-#   SLACK_USER_TOKEN  xoxp-...  used to search your mentions + check reactions
+#   SLACK_USER_TOKEN  xoxp-...  used to search your mentions (needs search:read only)
 #   YOUR_USER_ID      your Slack user ID
 # ---------------------------------------------------------------------------
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
@@ -37,16 +37,9 @@ except Exception as e:
     print(f"ERROR: User token check failed: {e}")
     raise SystemExit(1)
 
-if user_scopes:
-    granted = {s.strip() for s in user_scopes.split(",")}
-    for required in ("search:read", "reactions:read"):
-        if required not in granted:
-            print(
-                f"ERROR: User token is missing the '{required}' scope. "
-                "Add it under User Token Scopes, click 'Reinstall to Workspace', "
-                "then update SLACK_USER_TOKEN with the NEW xoxp- token."
-            )
-            raise SystemExit(1)
+if user_scopes and "search:read" not in {s.strip() for s in user_scopes.split(",")}:
+    print("ERROR: User token is missing the 'search:read' scope.")
+    raise SystemExit(1)
 
 try:
     bot_auth = bot_client.auth_test()
@@ -100,19 +93,11 @@ def is_bots_own_message(msg):
     )
 
 
-def has_reaction(channel_id, ts):
-    r = user_client.reactions_get(channel=channel_id, timestamp=ts)
-    return len((r.get("message") or {}).get("reactions", [])) > 0
+def msg_key(msg):
+    return ((msg.get("channel") or {}).get("id"), msg.get("ts"))
 
 
-def search_recent_mentions():
-    now = datetime.now()
-    since_ts = (now - timedelta(hours=LOOKBACK_HOURS)).timestamp()
-    # Slack's after: filter is day-granular and exclusive, so ask for a wider
-    # window and trim precisely by timestamp below.
-    after_date = (now - timedelta(hours=LOOKBACK_HOURS + 24)).strftime("%Y-%m-%d")
-    query = f"<@{YOUR_USER_ID}> after:{after_date}"
-
+def run_search(query, since_ts):
     matches, page = [], 1
     while page <= MAX_SEARCH_PAGES:
         res = user_client.search_messages(query=query, sort="timestamp", sort_dir="desc", count=100, page=page)
@@ -126,7 +111,23 @@ def search_recent_mentions():
         if float(page_matches[-1].get("ts", "0")) < since_ts:
             break
         page += 1
-    return matches, since_ts
+    return matches
+
+
+def search_recent_mentions():
+    now = datetime.now()
+    since_ts = (now - timedelta(hours=LOOKBACK_HOURS)).timestamp()
+    # Slack's after: filter is day-granular and exclusive, so ask for a wider
+    # window and trim precisely by timestamp below.
+    after_date = (now - timedelta(hours=LOOKBACK_HOURS + 24)).strftime("%Y-%m-%d")
+    base = f"<@{YOUR_USER_ID}> after:{after_date}"
+
+    all_mentions = run_search(base, since_ts)
+    # Same search, restricted to messages that already have ANY emoji reaction.
+    # Needs only search:read - no reactions:read scope required.
+    reacted = run_search(base + " has:reaction", since_ts)
+    reacted_keys = {msg_key(m) for m in reacted}
+    return all_mentions, reacted_keys, since_ts
 
 
 # ---- main ------------------------------------------------------------------
@@ -134,20 +135,19 @@ def check_mentions():
     print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Searching for unacknowledged mentions in last {LOOKBACK_HOURS}h...")
 
     try:
-        matches, since_ts = search_recent_mentions()
+        matches, reacted_keys, since_ts = search_recent_mentions()
     except Exception as e:
         print(f"ERROR: Search failed: {e}")
         raise SystemExit(1)
-    print(f"Search returned {len(matches)} result(s)")
+    print(f"Search returned {len(matches)} mention(s), {len(reacted_keys)} of them with a reaction")
 
     seen = set()
     pending = []
     skipped_reacted = skipped_bot = skipped_old = 0
 
     for msg in matches:
-        ts = msg.get("ts")
+        channel_id, ts = msg_key(msg)
         ch = msg.get("channel") or {}
-        channel_id = ch.get("id")
         if not ts or not channel_id:
             continue
         if (channel_id, ts) in seen:
@@ -160,16 +160,8 @@ def check_mentions():
         if is_bots_own_message(msg):
             skipped_bot += 1
             continue
-
-        try:
-            if has_reaction(channel_id, ts):
-                skipped_reacted += 1
-                continue
-        except Exception as e:
-            if "missing_scope" in str(e):
-                print(f"ERROR: reactions.get is missing a scope: {e}")
-                raise SystemExit(1)
-            print(f"WARN: could not check reactions for {channel_id}/{ts}, skipping this run: {e}")
+        if (channel_id, ts) in reacted_keys:
+            skipped_reacted += 1
             continue
 
         if msg.get("type") == "im" or ch.get("is_im"):
