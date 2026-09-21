@@ -1,5 +1,7 @@
+import json
 import os
 import re
+import time
 from datetime import datetime, timedelta
 
 from slack_sdk import WebClient
@@ -15,9 +17,11 @@ SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 SLACK_USER_TOKEN = os.environ.get("SLACK_USER_TOKEN")
 YOUR_USER_ID = os.environ.get("YOUR_USER_ID")
 
-LOOKBACK_HOURS = 24        # how far back to look for mentions
-MAX_ITEMS_IN_DM = 40       # safety cap on items listed in one reminder
-MAX_SEARCH_PAGES = 3       # safety cap on search pagination (100 results/page)
+LOOKBACK_HOURS = 24          # how far back to look for mentions
+MAX_DMS_PER_RUN = 30         # safety cap; anything beyond carries over to the next hour
+MAX_SEARCH_PAGES = 3         # safety cap on search pagination (100 results/page)
+STATE_FILE = "sent_messages.json"   # memory of what was already sent (kept between runs by the workflow cache)
+STATE_KEEP_DAYS = 7
 
 if not SLACK_BOT_TOKEN or not SLACK_USER_TOKEN or not YOUR_USER_ID:
     print("ERROR: Missing required secrets! Need SLACK_BOT_TOKEN, SLACK_USER_TOKEN, and YOUR_USER_ID.")
@@ -50,38 +54,69 @@ except Exception as e:
     print(f"ERROR: Bot token check failed: {e}")
     raise SystemExit(1)
 
+# ---- "already notified" memory -------------------------------------------
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+        sent = data.get("sent", {}) if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        print("No memory file found - first run (or cache expired).")
+        return {}
+    except Exception as e:
+        print(f"WARN: could not read {STATE_FILE}, starting fresh: {e}")
+        return {}
+    cutoff = time.time() - STATE_KEEP_DAYS * 86400
+    sent = {k: v for k, v in sent.items() if isinstance(v, (int, float)) and v >= cutoff}
+    print(f"Memory loaded: {len(sent)} mention(s) already notified")
+    return sent
+
+
+def save_state(sent):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump({"sent": sent}, f, indent=0)
+    except Exception as e:
+        print(f"WARN: could not write {STATE_FILE}: {e}")
+
+
 # ---- helpers ---------------------------------------------------------------
 _name_cache = {}
+_is_bot_cache = {}
 
 
-def display_name(user_id):
-    """Plain-text name for a user ID (never a real <@mention>, so the reminder
-    itself can never be picked up as a mention on the next run)."""
-    if not user_id:
-        return "unknown"
+def _lookup_user(user_id):
     if user_id in _name_cache:
-        return _name_cache[user_id]
-    name = user_id
+        return
+    name, is_bot = user_id, False
     try:
         u = bot_client.users_info(user=user_id).get("user", {}) or {}
         name = u.get("real_name") or (u.get("profile") or {}).get("display_name") or u.get("name") or user_id
+        is_bot = bool(u.get("is_bot")) or u.get("id") == "USLACKBOT"
     except Exception:
         pass
     _name_cache[user_id] = name
-    return name
+    _is_bot_cache[user_id] = is_bot
 
 
-MENTION_RE = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]*)?>")
-CHANNEL_RE = re.compile(r"<#([A-Z0-9]+)\|([^>]*)>")
+def sender_is_bot(msg):
+    """True for posts by apps, bots and Workflow Builder workflows."""
+    if msg.get("bot_id") or msg.get("subtype") == "bot_message":
+        return True
+    uid = msg.get("user")
+    if not uid:
+        return True
+    _lookup_user(uid)
+    return _is_bot_cache.get(uid, False)
 
 
-def clean_text(text, limit=150):
-    text = MENTION_RE.sub(
-        lambda m: "@you" if m.group(1) == YOUR_USER_ID else "@" + display_name(m.group(1)), text or ""
-    )
-    text = CHANNEL_RE.sub(lambda m: "#" + m.group(2), text)
-    text = " ".join(text.split())
-    return text[:limit] + ("..." if len(text) > limit else "")
+def display_name(user_id):
+    """Plain-text name (never a real <@mention>, so the reminder itself can
+    never be picked up as a mention on a later run)."""
+    if not user_id:
+        return "unknown"
+    _lookup_user(user_id)
+    return _name_cache.get(user_id, user_id)
 
 
 def is_bots_own_message(msg):
@@ -91,6 +126,22 @@ def is_bots_own_message(msg):
         or msg.get("username") == BOT_USERNAME
         or ch.get("name") == BOT_USER_ID  # the DM channel between you and the bot
     )
+
+
+_reaction_check_unavailable = set()
+
+
+def exact_has_reaction(channel_id, ts):
+    """Ask Slack directly whether the message has reactions. Returns True/False,
+    or None if Slack won't let the bot look at that channel."""
+    if channel_id in _reaction_check_unavailable:
+        return None
+    try:
+        r = bot_client.reactions_get(channel=channel_id, timestamp=ts)
+        return len((r.get("message") or {}).get("reactions", [])) > 0
+    except Exception:
+        _reaction_check_unavailable.add(channel_id)
+        return None
 
 
 def msg_key(msg):
@@ -107,8 +158,7 @@ def run_search(query, since_ts):
         total_pages = (block.get("paging") or {}).get("pages") or 1
         if not page_matches or page >= total_pages:
             break
-        # results are newest-first: stop once we're past the window
-        if float(page_matches[-1].get("ts", "0")) < since_ts:
+        if float(page_matches[-1].get("ts", "0")) < since_ts:  # newest-first: past the window
             break
         page += 1
     return matches
@@ -123,16 +173,25 @@ def search_recent_mentions():
     base = f"<@{YOUR_USER_ID}> after:{after_date}"
 
     all_mentions = run_search(base, since_ts)
-    # Same search, restricted to messages that already have ANY emoji reaction.
-    # Needs only search:read - no reactions:read scope required.
+    # Same search, restricted to messages that already have ANY emoji reaction
+    # (needs only search:read).
     reacted = run_search(base + " has:reaction", since_ts)
-    reacted_keys = {msg_key(m) for m in reacted}
-    return all_mentions, reacted_keys, since_ts
+    return all_mentions, {msg_key(m) for m in reacted}, since_ts
+
+
+def build_dm(msg):
+    sender = display_name(msg.get("user"))
+    return (
+        "You were mentioned :\n\n"
+        f"Sender: @{sender}\n\n"
+        f"Open the post: {msg.get('permalink', '')}"
+    )
 
 
 # ---- main ------------------------------------------------------------------
 def check_mentions():
     print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Searching for unacknowledged mentions in last {LOOKBACK_HOURS}h...")
+    sent = load_state()
 
     try:
         matches, reacted_keys, since_ts = search_recent_mentions()
@@ -143,58 +202,58 @@ def check_mentions():
 
     seen = set()
     pending = []
-    skipped_reacted = skipped_bot = skipped_old = 0
+    skipped_reacted = skipped_bot = skipped_old = skipped_sent = 0
 
     for msg in matches:
         channel_id, ts = msg_key(msg)
-        ch = msg.get("channel") or {}
-        if not ts or not channel_id:
-            continue
-        if (channel_id, ts) in seen:
+        if not ts or not channel_id or (channel_id, ts) in seen:
             continue
         seen.add((channel_id, ts))
+        key = f"{channel_id}:{ts}"
 
         if float(ts) < since_ts:
             skipped_old += 1
             continue
-        if is_bots_own_message(msg):
+        if is_bots_own_message(msg) or sender_is_bot(msg):
             skipped_bot += 1
             continue
-        if (channel_id, ts) in reacted_keys:
+        if key in sent:
+            skipped_sent += 1
+            continue
+
+        reacted = (channel_id, ts) in reacted_keys
+        exact = exact_has_reaction(channel_id, ts)
+        if exact is not None:
+            reacted = exact
+        if reacted:
             skipped_reacted += 1
             continue
 
-        if msg.get("type") == "im" or ch.get("is_im"):
-            where = "DM with " + display_name(ch.get("name"))
-        else:
-            where = "#" + (ch.get("name") or channel_id)
+        pending.append((key, msg))
 
-        pending.append({
-            "where": where,
-            "from": display_name(msg.get("user")),
-            "text": clean_text(msg.get("text")),
-            "link": msg.get("permalink", ""),
-        })
-
-    print(f"Skipped: {skipped_reacted} already reacted, {skipped_bot} bot's own reminders, {skipped_old} outside window")
+    print(f"Skipped: {skipped_sent} already notified, {skipped_reacted} already reacted, "
+          f"{skipped_bot} bot/workflow posts, {skipped_old} outside window")
 
     if not pending:
-        print("No unacknowledged mentions. Nothing sent.")
+        print("No new unacknowledged mentions. Nothing sent.")
+        save_state(sent)
         return
 
-    n = len(pending)
-    lines = [f"*You have {n} unacknowledged mention{'s' if n != 1 else ''}* (no emoji reaction yet). React to the original message to clear it."]
-    for it in pending[:MAX_ITEMS_IN_DM]:
-        lines.append(f"• *{it['where']}* — {it['from']}: \"{it['text']}\"  <{it['link']}|Open>")
-    if n > MAX_ITEMS_IN_DM:
-        lines.append(f"...and {n - MAX_ITEMS_IN_DM} more.")
+    # oldest first so DMs arrive in the order the mentions happened
+    pending.sort(key=lambda kv: float(kv[1].get("ts", "0")))
+    delivered = 0
+    for key, msg in pending[:MAX_DMS_PER_RUN]:
+        try:
+            bot_client.chat_postMessage(channel=YOUR_USER_ID, text=build_dm(msg))
+            sent[key] = time.time()
+            delivered += 1
+            print(f"DM sent for mention in #{(msg.get('channel') or {}).get('name', '?')}")
+        except Exception as e:
+            print(f"WARN: failed to send DM for {key}, will retry next run: {e}")
 
-    try:
-        bot_client.chat_postMessage(channel=YOUR_USER_ID, text="\n".join(lines), unfurl_links=False, unfurl_media=False)
-        print(f"Done. 1 reminder DM sent listing {n} mention(s).")
-    except Exception as e:
-        print(f"ERROR: Failed to send reminder DM: {e}")
-        raise SystemExit(1)
+    save_state(sent)
+    left = len(pending) - min(len(pending), MAX_DMS_PER_RUN)
+    print(f"Done. {delivered} new DM(s) sent." + (f" {left} more will go out next run." if left else ""))
 
 
 if __name__ == "__main__":
