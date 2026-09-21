@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 # Bot token (xoxb-...) — used only for sending you DMs
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 
-# User token (xoxp-...) — used for searching your mentions
+# User token (xoxp-...) — used for searching your mentions and checking reactions
 SLACK_USER_TOKEN = os.environ.get("SLACK_USER_TOKEN")
 
 # Your Slack user ID
@@ -75,10 +75,10 @@ def check_mentions():
 
             # No reaction — send DM via the bot
             message_text = (
-                f"You were mentioned:\n"
+                f"You were mentioned\n"
                 f"Channel: #{channel_name}\n"
                 f"From: <@{sender}>\n"
-                f"<{msg_link}|:point_right: View Message>"
+                f"<{permalink}|View Message>"
             )
 
             try:
