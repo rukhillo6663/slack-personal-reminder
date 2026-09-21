@@ -16,12 +16,26 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+
+      # Keeps sent_messages.json between runs so each mention is DM'd only once.
+      # A new cache entry is saved at the end of every run; the next run restores
+      # the most recent one.
+      - name: Restore "already notified" memory
+        uses: actions/cache@v4
+        with:
+          path: sent_messages.json
+          key: sent-messages-${{ github.run_id }}
+          restore-keys: |
+            sent-messages-
+
       - name: Install dependencies
         run: pip install slack-sdk
+
       - name: Run personal reminder bot
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
