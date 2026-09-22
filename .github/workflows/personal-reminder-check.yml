@@ -5,11 +5,15 @@ on:
     # GitHub Actions cron is in UTC. Dubai = UTC+4.
     # 10-19 UTC = 2:00 PM - 11:00 PM Dubai, one run per hour.
     # The 2:00 PM Dubai run (10:17 UTC) is the daily sweep: the Python widens
-    # its window to 17h so it covers everything back to 11:00 PM the night before.
+    # its window to cover everything back to 11:00 PM the night before.
     # Minute 17 (not :00) is deliberate: the top of the hour is GitHub's most
     # congested slot and the most likely to be delayed or silently skipped.
     - cron: '17 10-19 * * *'
   workflow_dispatch:
+
+# Needed so the run can commit the dedup state file back to the repo.
+permissions:
+  contents: write
 
 jobs:
   check-mentions:
@@ -34,6 +38,19 @@ jobs:
           SLACK_USER_TOKEN: ${{ secrets.SLACK_USER_TOKEN }}
           YOUR_USER_ID: ${{ secrets.YOUR_USER_ID }}
         run: python personal-reminder-bot.py
+
+      - name: Persist dedup state
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain .reminder-state)" ]; then
+            git config user.name "reminder-bot"
+            git config user.email "actions@users.noreply.github.com"
+            git add .reminder-state
+            git commit -m "chore: update reminder dedup state [skip ci]"
+            git push
+          else
+            echo "No state change to commit."
+          fi
 
       - name: Log run time (debug)
         if: always()
