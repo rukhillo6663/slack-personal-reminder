@@ -1,3 +1,4 @@
+import json
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -7,12 +8,12 @@ from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
 # ---------------------------------------------------------------------------
 # Secrets (GitHub -> Settings -> Secrets and variables -> Actions)
 #   SLACK_BOT_TOKEN   xoxb-...  used ONLY to send you the reminder DM
-#   SLACK_USER_TOKEN  xoxp-...  used to search your mentions AND react as you
-#                               (needs scopes: search:read, reactions:write)
+#   SLACK_USER_TOKEN  xoxp-...  used to search your mentions (needs: search:read)
 #   YOUR_USER_ID      your Slack user ID (U...)
 #
-# Optional override (GitHub -> Variables, not Secrets):
-#   LOOKBACK_HOURS_OVERRIDE   force a specific window (used by the morning sweep)
+# NOTE: This version does NOT need reactions:write. Dedup is handled by a small
+# state file committed back to the repo (see STATE_FILE), so no message is ever
+# DMed twice even though the bot never touches reactions.
 # ---------------------------------------------------------------------------
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 SLACK_USER_TOKEN = os.environ.get("SLACK_USER_TOKEN")
@@ -21,8 +22,10 @@ YOUR_USER_ID = os.environ.get("YOUR_USER_ID")
 # Dubai is UTC+4, with no daylight saving.
 DUBAI = timezone(timedelta(hours=4))
 
-# Marker reaction the bot adds on your behalf. "eyes" = seen.
-MARKER_EMOJI = "eyes"
+# Where the dedup memory lives. The workflow commits this file back to the repo
+# after each run, so the next run remembers what was already sent.
+STATE_FILE = os.environ.get("STATE_FILE", ".reminder-state/sent.json")
+STATE_RETENTION_DAYS = 7   # forget entries older than this so the file stays small
 
 # Default rolling window for the hourly daytime runs. Generous overlap so a
 # skipped or delayed GitHub run is always caught by the following one.
@@ -84,6 +87,39 @@ def resolve_lookback_hours():
 LOOKBACK_HOURS = resolve_lookback_hours()
 
 
+# ---- dedup state (committed back to the repo by the workflow) --------------
+def load_state():
+    """Return {key: iso_timestamp} of mentions already DMed, pruned to recent."""
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"WARN: could not read state file ({STATE_FILE}): {e}. Starting fresh.")
+        return {}
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=STATE_RETENTION_DAYS)
+    pruned = {}
+    for key, iso in data.items():
+        try:
+            if datetime.fromisoformat(iso) >= cutoff:
+                pruned[key] = iso
+        except Exception:
+            pruned[key] = iso  # keep anything unparseable rather than lose it
+    return pruned
+
+
+def save_state(state):
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, sort_keys=True)
+        print(f"State saved: {len(state)} remembered mention(s) in {STATE_FILE}")
+    except Exception as e:
+        print(f"WARN: could not write state file ({STATE_FILE}): {e}")
+
+
 # ---- verify tokens --------------------------------------------------------
 try:
     user_auth = user_client.auth_test()
@@ -94,10 +130,8 @@ except Exception as e:
     print(f"ERROR: User token check failed: {e}")
     raise SystemExit(1)
 
-missing = {"search:read", "reactions:write"} - scope_set
-if user_scopes and missing:
-    print(f"ERROR: User token is missing scope(s): {', '.join(sorted(missing))}. "
-          f"Add them under User Token Scopes and reinstall the app.")
+if user_scopes and "search:read" not in scope_set:
+    print("ERROR: User token is missing the 'search:read' scope.")
     raise SystemExit(1)
 
 try:
@@ -159,16 +193,15 @@ def is_bots_own_message(msg):
 
 
 def has_any_reaction(msg):
-    """Any reaction at all -> already acknowledged, skip.
-    Slack's search returns a 'reactions' array on matched messages when present.
-    We treat the presence of that array (from the has:reaction search) as truth,
-    but also check the field directly as a fallback."""
-    rxns = msg.get("reactions")
-    return bool(rxns)
+    """Any reaction at all -> you've acknowledged it yourself, skip.
+    This still works with only search:read (via the has:reaction search and the
+    reactions array Slack returns on matched messages)."""
+    return bool(msg.get("reactions"))
 
 
 def msg_key(msg):
-    return ((msg.get("channel") or {}).get("id"), msg.get("ts"))
+    ch, ts = (msg.get("channel") or {}).get("id"), msg.get("ts")
+    return f"{ch}_{ts}"  # string key so it serializes cleanly into JSON state
 
 
 def run_search(query, since_ts):
@@ -201,20 +234,6 @@ def search_recent_mentions():
     return all_mentions, {msg_key(m) for m in reacted}, since_ts
 
 
-def add_marker_reaction(channel_id, ts):
-    """Add the marker reaction AS YOU (user token). Works in any channel you can
-    see, no bot membership needed. This is what dedupes future runs."""
-    try:
-        user_client.reactions_add(channel=channel_id, timestamp=ts, name=MARKER_EMOJI)
-        return True
-    except Exception as e:
-        # already_reacted is fine - the mark is there either way.
-        if "already_reacted" in str(e):
-            return True
-        print(f"WARN: could not add :{MARKER_EMOJI}: reaction ({channel_id}/{ts}): {e}")
-        return False
-
-
 def build_dm(msg):
     sender = display_name(msg.get("user"))
     return (
@@ -230,6 +249,10 @@ def check_mentions():
     print(f"\n[{now_dubai:%Y-%m-%d %H:%M:%S} Dubai] "
           f"Searching unacknowledged mentions in last {LOOKBACK_HOURS}h...")
 
+    state = load_state()          # {key: iso} already DMed on a previous run
+    already_sent = set(state)
+    print(f"Loaded {len(already_sent)} previously-sent mention(s) from state.")
+
     try:
         matches, reacted_keys, since_ts = search_recent_mentions()
     except Exception as e:
@@ -239,13 +262,15 @@ def check_mentions():
 
     seen = set()
     pending = []
-    skipped_reacted = skipped_bot = skipped_old = 0
+    skipped_reacted = skipped_bot = skipped_old = skipped_sent = 0
 
     for msg in matches:
-        channel_id, ts = msg_key(msg)
-        if not ts or not channel_id or (channel_id, ts) in seen:
+        key = msg_key(msg)
+        ch = (msg.get("channel") or {}).get("id")
+        ts = msg.get("ts")
+        if not ts or not ch or key in seen:
             continue
-        seen.add((channel_id, ts))  # in-run dedup: overlapping searches can't double-send
+        seen.add(key)  # in-run dedup: overlapping searches can't double-send
 
         if float(ts) < since_ts:
             skipped_old += 1
@@ -253,35 +278,43 @@ def check_mentions():
         if is_bots_own_message(msg) or sender_is_bot(msg):
             skipped_bot += 1
             continue
-        # Any reaction (yours, the marker from a prior run, or anyone's) -> skip.
-        if (channel_id, ts) in reacted_keys or has_any_reaction(msg):
+        # You reacted to it yourself -> you've seen it, skip.
+        if key in reacted_keys or has_any_reaction(msg):
             skipped_reacted += 1
+            continue
+        # Already DMed on an earlier run -> never send twice.
+        if key in already_sent:
+            skipped_sent += 1
             continue
 
         pending.append(msg)
 
-    print(f"Skipped: {skipped_reacted} already reacted, {skipped_bot} bot/workflow, {skipped_old} outside window")
+    print(f"Skipped: {skipped_sent} already sent, {skipped_reacted} you reacted, "
+          f"{skipped_bot} bot/workflow, {skipped_old} outside window")
 
     if not pending:
         print("No new unacknowledged mentions. Nothing sent.")
+        save_state(state)  # still rewrite (prunes old entries)
         return
 
     # oldest first so DMs arrive in chronological order
     pending.sort(key=lambda m: float(m.get("ts", "0")))
     delivered = 0
+    now_iso = datetime.now(timezone.utc).isoformat()
     for msg in pending[:MAX_DMS_PER_RUN]:
-        channel_id, ts = msg_key(msg)
-        # Mark FIRST, then DM. If marking fails we still DM, but marking first
-        # means a crash mid-loop can't leave a DM'd item unmarked (which would
-        # re-DM next run). Worst case on mark-fail is one possible duplicate.
-        add_marker_reaction(channel_id, ts)
+        key = msg_key(msg)
+        # Record BEFORE sending so a crash mid-loop can't re-DM an item that
+        # already went out. Worst case if the DM then fails: one missed reminder,
+        # not a duplicate. (The WARN below makes that visible in the run log.)
+        state[key] = now_iso
         try:
             bot_client.chat_postMessage(channel=YOUR_USER_ID, text=build_dm(msg))
             delivered += 1
             print(f"DM sent for mention in #{(msg.get('channel') or {}).get('name', '?')}")
         except Exception as e:
-            print(f"WARN: failed to send DM: {e}")
+            print(f"WARN: failed to send DM (will not retry this one): {e}")
 
+    save_state(state)
     print(f"Done. {delivered} new DM(s) sent.")
 
 
