@@ -2,14 +2,20 @@ name: Personal Reminder Bot - Hourly Check
 
 on:
   schedule:
-    - cron: '0 4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23 * * *'
+    # GitHub Actions cron is in UTC. Dubai = UTC+4.
+    # 10-19 UTC = 2:00 PM - 11:00 PM Dubai, one run per hour.
+    # The 2:00 PM Dubai run (10:17 UTC) is the daily sweep: the Python widens
+    # its window to 17h so it covers everything back to 11:00 PM the night before.
+    # Minute 17 (not :00) is deliberate: the top of the hour is GitHub's most
+    # congested slot and the most likely to be delayed or silently skipped.
+    - cron: '17 10-19 * * *'
   workflow_dispatch:
 
 jobs:
   check-mentions:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -28,3 +34,8 @@ jobs:
           SLACK_USER_TOKEN: ${{ secrets.SLACK_USER_TOKEN }}
           YOUR_USER_ID: ${{ secrets.YOUR_USER_ID }}
         run: python personal-reminder-bot.py
+
+      - name: Log run time (debug)
+        if: always()
+        run: |
+          echo "Ran at $(date -u +'%Y-%m-%d %H:%M:%S') UTC = $(TZ=Asia/Dubai date +'%Y-%m-%d %H:%M:%S') Dubai"
