@@ -234,11 +234,31 @@ def search_recent_mentions():
     return all_mentions, {msg_key(m) for m in reacted}, since_ts
 
 
+def is_direct_or_group(msg):
+    """True for 1:1 DMs and group DMs. Slack already sends you a native
+    notification for those, so the bot skips them - it only covers channel
+    mentions you might scroll past. DM channel IDs start with 'D', group DMs
+    with 'G' (or an 'mpdm' name); a DM's channel 'name' is the other user's
+    ID (starts with U/W, all caps) rather than a real channel name."""
+    ch = msg.get("channel") or {}
+    cid = ch.get("id", "") or ""
+    cname = ch.get("name", "") or ""
+    if cid.startswith("D") or cid.startswith("G"):
+        return True
+    if cname.startswith("mpdm"):
+        return True
+    if cname[:1] in ("U", "W") and cname.isupper():
+        return True
+    return False
+
+
 def build_dm(msg):
     sender = display_name(msg.get("user"))
+    ch = msg.get("channel") or {}
+    where = f"#{ch.get('name')}" if ch.get("name") else "a channel"
     return (
-        "You were mentioned :\n\n"
-        f"Sender: @{sender}\n\n"
+        f"You were mentioned in {where}:\n\n"
+        f"From: @{sender}\n\n"
         f"Open the post: {msg.get('permalink', '')}"
     )
 
@@ -262,7 +282,7 @@ def check_mentions():
 
     seen = set()
     pending = []
-    skipped_reacted = skipped_bot = skipped_old = skipped_sent = 0
+    skipped_reacted = skipped_bot = skipped_old = skipped_sent = skipped_dm = 0
 
     for msg in matches:
         key = msg_key(msg)
@@ -274,6 +294,10 @@ def check_mentions():
 
         if float(ts) < since_ts:
             skipped_old += 1
+            continue
+        # DMs and group DMs -> Slack already notifies you natively, skip.
+        if is_direct_or_group(msg):
+            skipped_dm += 1
             continue
         if is_bots_own_message(msg) or sender_is_bot(msg):
             skipped_bot += 1
@@ -290,7 +314,7 @@ def check_mentions():
         pending.append(msg)
 
     print(f"Skipped: {skipped_sent} already sent, {skipped_reacted} you reacted, "
-          f"{skipped_bot} bot/workflow, {skipped_old} outside window")
+          f"{skipped_dm} DM/group-DM, {skipped_bot} bot/workflow, {skipped_old} outside window")
 
     if not pending:
         print("No new unacknowledged mentions. Nothing sent.")
