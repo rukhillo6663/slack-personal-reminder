@@ -3,17 +3,29 @@ name: Personal Reminder Bot - Hourly Check
 on:
   schedule:
     # GitHub Actions cron is in UTC. Dubai = UTC+4.
-    # 10-19 UTC = 2:00 PM - 11:00 PM Dubai, one run per hour.
-    # The 2:00 PM Dubai run (10:17 UTC) is the daily sweep: the Python widens
-    # its window to cover everything back to 11:00 PM the night before.
-    # Minute 17 (not :00) is deliberate: the top of the hour is GitHub's most
-    # congested slot and the most likely to be delayed or silently skipped.
-    - cron: '17 10-19 * * *'
+    # 10-19 UTC = 2:00 PM - 11:00 PM Dubai. Runs every 15 minutes (at :02, :17,
+    # :32, :47) so that even when GitHub silently drops some scheduled runs,
+    # at least one attempt per hour still lands. Extra runs are harmless: the
+    # dedup state stops any repeat DM. Off :00 on purpose - the top of the hour
+    # is GitHub's most congested, most-dropped slot.
+    #
+    # Every run in the 2 PM Dubai hour (10:xx UTC) is treated as the daily sweep
+    # by the Python (hour == 14): it widens the window back to 11 PM last night.
+    # The first one delivers the overnight mentions; the rest are dedup no-ops.
+    - cron: '2,17,32,47 10-19 * * *'
   workflow_dispatch:
 
 # Needed so the run can commit the dedup state file back to the repo.
 permissions:
   contents: write
+
+# Serialize runs so two of them can never race on the state-file commit/push
+# (which could otherwise drop a state update and cause a duplicate DM). With
+# 15-minute spacing and ~15s runtime they never actually overlap, but this
+# guarantees it. cancel-in-progress: false = queue, don't cancel.
+concurrency:
+  group: personal-reminder-bot
+  cancel-in-progress: false
 
 jobs:
   check-mentions:
