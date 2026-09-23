@@ -1,5 +1,7 @@
 name: Personal Reminder Bot - Hourly Check
 
+# schedule re-registration bump: v3 (2026-09-23)
+
 on:
   schedule:
     # GitHub Actions cron is in UTC. Dubai = UTC+4.
@@ -18,14 +20,6 @@ on:
 # Needed so the run can commit the dedup state file back to the repo.
 permissions:
   contents: write
-
-# Serialize runs so two of them can never race on the state-file commit/push
-# (which could otherwise drop a state update and cause a duplicate DM). With
-# 15-minute spacing and ~15s runtime they never actually overlap, but this
-# guarantees it. cancel-in-progress: false = queue, don't cancel.
-concurrency:
-  group: personal-reminder-bot
-  cancel-in-progress: false
 
 jobs:
   check-mentions:
@@ -59,7 +53,13 @@ jobs:
             git config user.email "actions@users.noreply.github.com"
             git add .reminder-state
             git commit -m "chore: update reminder dedup state [skip ci]"
-            git push
+            # Rebase + retry so two near-simultaneous runs can't lose a state
+            # update (replaces the old concurrency guard, without touching scheduling).
+            for i in 1 2 3; do
+              git pull --rebase --autostash origin "${GITHUB_REF_NAME}" \
+                && git push && break
+              echo "push attempt $i failed; retrying..."; sleep 3
+            done
           else
             echo "No state change to commit."
           fi
